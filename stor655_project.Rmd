@@ -1,0 +1,370 @@
+---
+title: "STOR655_Project"
+author: "Joe Lavond"
+date: "4/8/2021"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+
+try(detach("package:MASS", unload=TRUE), silent = T)
+
+# Set options
+library(rstudioapi)
+options(scipen = 999)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE) # knit output only
+knitr::opts_knit$set(root.dir = dirname(getActiveDocumentContext()$path)) # setwd
+knitr::opts_chunk$set(cache.extra = set.seed(1234)) # set seed globally for knit
+
+# Modeling Packages
+library(caret)
+library(leaps)
+
+# Visualization Packages
+library(ggrepel)
+library(maps)
+
+# Manipulation Packages
+library(data.table)
+library(tidyverse)
+library(lubridate)
+library(matrixStats)
+
+```
+
+```{r census manipulation}
+
+census <- fread("census.csv")
+names(census) <- tolower(names(census))
+
+# Factor labels introduced: see link below for details
+# https://www2.census.gov/programs-surveys/popest/technical-documentation/file-layouts/2010-2019/sc-est2019-alldata6.pdf
+census$region <- factor(census$region, levels = 1:4, labels = c("NE", "MW", "S", "W"))
+census$sex <- factor(census$sex, levels = 0:2, labels = c("total", "male", "female"))
+census$hisp <- factor(census$origin, levels = 0:2, labels = c("total", "non-hispanic", "hispanic"))
+census$race <- factor(census$race, levels = 1:6, labels = c("white", "black", "native", "asian", "islander", "mixed"))
+
+# Create year column for est pop
+census_wide <- census %>% 
+   pivot_longer(cols = (names(.)[str_detect(names(.), "popest")]), 
+                names_to = "year", names_prefix = "popestimate", values_to = "est_population") %>% 
+   mutate(state = name) %>% 
+   filter(state != "District of Columbia") %>% 
+   select(-c(sumlev, census2010pop, estimatesbase2010, origin, division, name))
+
+# For overall totals
+census_totals <- census_wide %>% 
+   filter(sex == "total" & hisp == "total") %>% 
+   select(-c(sex, race, hisp)) %>% group_by(state, year, region) %>% 
+   summarise(est_pop_total = sum(est_population), median_age = weightedMedian(x = age, w = est_population, na.rm = T))
+
+# At group levels
+census_grp_init <- census_wide %>% 
+   group_by(state, year, sex, race, hisp) %>% 
+   select(-region, -age) %>% 
+   filter(sex == "total" | hisp == "total") %>% 
+   summarise(group_est_pop = sum(est_population))
+
+census_male <- census_grp_init %>% filter(sex == "male" & hisp == "total") %>% 
+   group_by(state, year) %>% summarise(est_pop_male = sum(group_est_pop))
+
+census_hisp <- census_grp_init %>% filter(sex == "total" & hisp == "hispanic") %>% 
+   group_by(state, year) %>% summarise(est_pop_hisp = sum(group_est_pop))
+
+census_race <- census_grp_init %>% filter(sex == "total" & hisp == "total") %>% 
+   group_by(state, year, race) %>% summarise(est_race_pop = sum(group_est_pop)) %>% 
+   pivot_wider(names_from = race, values_from = est_race_pop, names_prefix = "est_pop_")
+
+census_final <- census_totals %>% 
+   left_join(census_male, by = c("state", "year")) %>% 
+   left_join(census_hisp, by = c("state", "year")) %>% 
+   left_join(census_race, by = c("state", "year")) %>% 
+   mutate(year = as.numeric(year))
+
+```
+
+```{r crime manipulation}
+
+crime <- fread("crime.csv") 
+
+# tally crimes both violent and non-violent ea year/state
+crime_final <- crime %>%
+   filter(year >= 2010 & state_name != "" & state_name != "District of Columbia") %>% 
+   mutate(other_crime = property_crime + burglary + larceny + motor_vehicle_theft, 
+          state = state_name) %>% 
+   select(year, state, violent_crime, other_crime)
+
+```
+
+```{r employment manipulation}
+
+employment <- fread("employment.csv")
+
+# get state names
+employment <- employment %>% filter(state_postal_abbr %in% state.abb & data_year >= 2010)
+for (i in 1:dim(employment)[1]){
+   employment$state[i] <- state.name[which(state.abb == employment$state_postal_abbr[i])]
+}
+
+employment_final <- employment %>% 
+   mutate(year = data_year) %>% 
+   select(state, year, officer_count, civilian_count)
+
+```
+
+```{r shootings manipulation}
+
+shoot <- read_csv("https://raw.githubusercontent.com/washingtonpost/data-police-shootings/master/fatal-police-shootings-data.csv")
+
+# get shooting year
+shoot <- shoot %>% select(state, date)
+shoot$date <- date(shoot$date)
+shoot <- shoot %>% 
+   mutate(year = year(date)) %>% 
+   filter(state %in% state.abb & year >= 2010) 
+
+# get state names
+for (i in 1:dim(shoot)[1]){
+   shoot$state[i] <- state.name[which(state.abb == shoot$state[i])]
+}
+
+shoot_final <- shoot %>% group_by(state, year) %>% summarise(fatalities = n())
+
+```
+
+
+```{r final merge}
+
+final <- census_final %>% 
+   left_join(crime_final, by = c("state", "year")) %>% 
+   left_join(employment_final, by = c("state", "year")) %>% 
+   left_join(shoot_final, by = c("state", "year")) %>% 
+   filter(year >= 2015) 
+
+final$fatalities[is.na(final$fatalities)] <- 0
+
+to_map <- shoot_final %>% 
+   left_join(crime_final, by = c("state", "year")) %>% 
+   left_join(employment_final, by = c("state", "year")) %>% 
+   left_join(census_final, by = c("state", "year"))
+
+```
+
+```{r preprocessing}
+
+train_prop <- .75
+set.seed(1234)
+
+# Get dummy vars after subsetting to cols of interest
+final_sub <- final %>% 
+   ungroup() %>% 
+   select(-state, -est_pop_white, -est_pop_native, -est_pop_asian, -est_pop_islander, -est_pop_mixed) %>% 
+   mutate(pop_copy = est_pop_total, 
+          across(c(contains("est"), contains("crime"), contains("count")), 
+                 ~ . / est_pop_total)) %>% 
+   rename_with(.cols = c(contains("est"), contains("crime"), contains("count")), 
+               ~ paste(., "_rate", sep = "")) %>% 
+   mutate(est_total_pop = pop_copy) %>% 
+   select(-est_pop_total_rate, -pop_copy)
+
+final_sub_main <- final_sub %>% select(!c(year, region, fatalities))
+final_sub_other <- final_sub %>% select(year, region, fatalities)
+
+# test-train split 75:25
+train_i <- sample(1:dim(final_sub)[1], size = train_prop*dim(final_sub)[1])
+
+x_train_main <- final_sub_main[train_i,]
+x_train_other <- final_sub_other[train_i,]
+
+x_test_main <- final_sub_main[-train_i,]
+x_test_other <- final_sub_other[-train_i,]
+
+# scale q vars
+pp_obj <- preProcess(x_train_main, method = c("center", "scale"))
+x_train_main_std <- predict(pp_obj, x_train_main)
+x_test_main_std <- predict(pp_obj, x_test_main)
+
+x_train <- cbind(x_train_main_std, x_train_other) %>% 
+   mutate(year_2017 = year - 2017) %>% select(-year)
+x_test <- cbind(x_test_main_std, x_test_other) %>% 
+   mutate(year_2017 = year - 2017) %>% select(-year)
+
+fatalities_train <- x_train$fatalities
+fatalities_test <- x_test$fatalities
+
+fatalities_rate_train <- x_train$fatalities_rate
+fatalities_rate_test <- x_test$fatalities_rate
+
+```
+
+```{r lm}
+
+# Sqrt var stabilizing transform
+x_train_lm_sqrt <- x_train %>% as_tibble() %>% 
+   mutate(sqrt_fatalities = sqrt(fatalities)) %>% 
+             select(-c(fatalities))  
+
+model_lm_sqrt <- train(sqrt_fatalities ~ ., data = x_train_lm_sqrt, method = "glmStepAIC")
+model_lm_sqrt$finalModel
+
+par(mfrow = c(2, 2))
+plot(model_lm_sqrt$finalModel)
+
+```
+
+```{r penalized lm}
+
+train_control <- trainControl(method="repeatedcv", number=10, repeats=3)
+
+model_lmnet_sqrt <- train(sqrt_fatalities ~ ., data = x_train_lm_sqrt, method = "glmnet", tuneLength = 10, trControl = train_control)
+model_lmnet_sqrt$bestTune
+
+```
+
+```{r glm}
+
+x_train_pois <- x_train 
+
+model_pois <- train(fatalities ~ ., family = "poisson", data = x_train_pois, method = "glmStepAIC")
+model_pois$finalModel
+
+par(mfrow = c(2, 2))
+plot(model_pois$finalModel)
+
+model_pois2 <- train(fatalities ~ ., family = "poisson", data = x_train_pois[-165,], method = "glmStepAIC")
+model_pois2$finalModel
+
+par(mfrow = c(2, 2))
+plot(model_pois2$finalModel)
+
+```
+
+```{r penalized glm}
+
+model_poisnet <- train(fatalities ~ ., family = "poisson", data = x_train_pois, 
+                       method = "glmnet", tuneLength = 10, trControl = train_control)
+
+model_poisnet2 <- train(fatalities ~ ., family = "poisson", data = x_train_pois[-163,], 
+                       method = "glmnet", tuneLength = 10, trControl = train_control)
+
+```
+
+```{r lm model comparison}
+
+# sqrt lm to sqrt lasso
+
+x_test_lm_sqrt <- x_test %>% as_tibble() %>% 
+   mutate(sqrt_fatalities = sqrt(fatalities)) %>% 
+             select(-c( fatalities))  
+
+pred_lm_sqrt <- predict(model_lm_sqrt, newdata = x_test_lm_sqrt)
+
+pred_lmnet_sqrt <- predict(model_lmnet_sqrt, newdata = x_test_lm_sqrt)
+
+# combine results
+lm_compare <- as_tibble(rbind(
+   cbind(model = "sqrt lm", pred = pred_lm_sqrt, act = x_test_lm_sqrt$sqrt_fatalities),
+   cbind(model = "sqrt enet", pred = pred_lmnet_sqrt, act = x_test_lm_sqrt$sqrt_fatalities)
+))
+
+lm_compare$pred <- as.numeric(lm_compare$pred)
+lm_compare$act <- as.numeric(lm_compare$act)
+
+lm_compare %>% mutate(e = act - pred) %>% group_by(model) %>% summarise(rmspe = sum(e^2) / n())
+
+lm_compare %>% ggplot(aes(x = act, y = pred, col = model)) + geom_point()
+
+```
+
+```{r glm model compare}
+
+# pois vs poisnet
+x_test_pois <- x_test
+
+pred_pois <- predict(model_pois, newdata = x_test_pois)
+pred_pois2 <- predict(model_pois2, newdata = x_test_pois)
+
+pred_poisnet <- exp(predict(model_poisnet, newdata = x_test_pois)) # predicts log mean as default
+pred_poisnet2 <- exp(predict(model_poisnet2, newdata = x_test_pois))
+
+# combine results
+pois_compare <- as_tibble(rbind(
+   cbind(model = "pois", pred = pred_pois, act = x_test$fatalities),
+   cbind(model = "pois2", pred = pred_pois2, act = x_test$fatalities), 
+   cbind(model = "poisnet", pred = pred_poisnet, act = x_test$fatalities),
+   cbind(model = "poisnet2", pred = pred_poisnet2, act = x_test$fatalities) 
+))
+
+pois_compare$pred <- as.numeric(pois_compare$pred)
+pois_compare$act <- as.numeric(pois_compare$act)
+
+pois_compare %>% mutate(e = act - pred) %>% group_by(model) %>% summarise(rmspe = sum(e^2) / n())
+
+pois_compare %>% ggplot(aes(x = act, y = pred, col = model)) + geom_point()
+
+```
+
+```{r final models}
+
+# best lm
+model_lmnet_sqrt$bestTune
+coef(model_lmnet_sqrt$finalModel, model_lmnet_sqrt$bestTune$lambda)
+exp(coef(model_lmnet_sqrt$finalModel, model_lmnet_sqrt$bestTune$lambda))
+
+# best pois
+model_poisnet$bestTune
+coef(model_poisnet$finalModel, model_poisnet$bestTune$lambda)
+exp(coef(model_poisnet$finalModel, model_poisnet$bestTune$lambda))
+
+# model_poisnet2$bestTune
+# coef(model_poisnet2$finalModel, model_poisnet2$bestTune$lambda)
+
+```
+
+```{r map}
+
+states <- map_data("state")
+
+# get state abb
+final_copy <- to_map
+for (row in 1:dim(final_copy)[1]){
+   final_copy$state_abb[row] <- state.abb[which(state.name == final_copy$state[row])]
+}
+
+plot_info <- final_copy %>% 
+   filter(year == 2016) %>% 
+   select(state_abb, fatalities, region) %>% 
+   rename(section = region) %>% 
+   full_join(tibble(state_abb = state.abb,
+                state_clong = state.center$x,
+                state_clat = state.center$y, 
+                region = tolower(state.name)),
+         by = "state_abb")
+
+plot_info <- plot_info %>% 
+   left_join(final_copy %>% filter(year == 2020) %>% select(fatalities), by = "state") %>% 
+   rename(fatalities = fatalities.y) %>% select(-fatalities.x)
+
+plot_info$fatalities[is.na(plot_info$fatalities)] <- 0
+
+p_final <- plot_info %>% 
+   left_join(states, by = "region") 
+
+p_final %>% ggplot() + 
+   geom_polygon(aes(x = long, y = lat, fill = section, group = group), color = "white") + 
+   coord_quickmap() + geom_label_repel(data = plot_info, aes(label = fatalities, x = state_clong, y = state_clat))  + 
+   ggtitle("Fatal Police Shootings for 2020") + labs(fill = "Region") + 
+   theme_classic() + theme(axis.line = element_blank(), axis.text = element_blank(), 
+                           axis.ticks = element_blank(), axis.title = element_blank(),
+                           plot.title = element_text(hjust = 0.5))
+
+```
+
+
+
+
+
+
+
+
+

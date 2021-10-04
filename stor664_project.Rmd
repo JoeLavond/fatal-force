@@ -1,0 +1,271 @@
+---
+title: "STOR 664 Project"
+author: "Shaleni Kovach, Joseph Lavond, Emma Mitchell"
+date: "10/21/2020"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+set.seed(1190)
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set WD
+library(rstudioapi)
+knitr::opts_knit$set(root.dir = dirname(getActiveDocumentContext()$path))
+
+# Modeling Packages
+library(MASS)
+library(leaps)
+library(glmnet)
+library(caret)
+
+# Manipulation Packages
+library(tidyverse)
+library(lubridate)
+library(gridExtra)
+
+# Run Data Manipulation - "main"
+source("project_data_merge.R")
+
+```
+
+```{r main dataset additional manipulation}
+set.seed(1190)
+
+main2 <- main %>% 
+   filter(year < 2020) %>% 
+   mutate(sqrt_fatalities = sqrt(fatalities)) %>% 
+   select(-c(fatalities, state_abb)) 
+
+```
+
+
+```{r test/train split}
+set.seed(1190)
+
+# Create dummy vars for region
+x <- as.tibble(model.matrix(sqrt_fatalities ~ .,data = main2))[,-1] # without intercept
+
+# Test/train partition
+N <- dim(main2)[1]
+train_i <- sample(1:N, size = .75*N, replace = F)
+
+train_x <- x[train_i,]
+test_x <- x[-train_i,]
+
+train_y <- main2$sqrt_fatalities[train_i]
+test_y <- main2$sqrt_fatalities[-train_i]
+
+# Investigate correlated predictors
+cor_x <- cor(train_x)[,findCorrelation(cor(train_x), cutoff = .5, names = T)]
+
+# Standardize X's
+pp_obj <- preProcess(train_x, method = c("center", "scale"))
+ctrain_x <- predict(pp_obj, train_x)
+ctest_x <- predict(pp_obj, test_x)
+
+train <- as.tibble(cbind(sqrt_y = train_y, as.tibble(ctrain_x)))
+test <- as.tibble(cbind(sqrt_y = test_y, as.tibble(ctest_x)))
+
+```
+
+```{r quick eda}
+set.seed(1190)
+
+for (col in names(ctrain_x)){
+   print(
+      train %>% ggplot(aes(x = !!as.name(col), y = sqrt_y)) + 
+         geom_point() + geom_smooth(method = "lm")
+   )
+}
+
+```
+
+```{r grouped ols modeling}
+set.seed(1190)
+
+# model with best RSS of each size
+gols.full <- summary(regsubsets(sqrt_y ~ ., data = train, nbest = 5, nvmax = 20))
+
+# Create object of models to find grouped models
+gols.sub <- cbind(p = row.names(gols.full$which), 
+                 as.tibble(gols.full$which), 
+                 rss = gols.full$rss,
+                 adjr2 = gols.full$adjr2,
+                 bic = gols.full$bic)
+
+# Select "best" grouped model
+n <- length(train_i)
+gols.sub <- gols.sub %>% 
+   mutate(grouped = ((regionMW + regionS + regionW) == 0 | (regionMW + regionS + regionW) == 3)) %>% 
+   filter(grouped == T) %>% 
+   distinct(p, grouped, .keep_all = T)
+
+# Calculate AIC
+gols.sub$aic = n * log(gols.sub$rss/n) + 2 * (as.integer(gols.sub$p) + 1)
+
+# "Best" ols gmodels by various criteria
+gols.sub[c(which.max(gols.sub$adjr2),
+          which.min(gols.sub$bic),
+          which.min(gols.sub$aic)),]
+
+gmod.adjr2 <- lm(sqrt_y ~ year + officers_per_1000 + civilians_per_1000 + population + regionMW + regionS + regionW + hisp_prop + black_prop + violent_prop + crime_per_1000, 
+                data = train)
+
+gmod.bic <- lm(sqrt_y ~ officers_per_1000 + population + regionMW + regionS + regionW + hisp_prop + black_prop + crime_per_1000, 
+                data = train)
+
+par(mfrow = c(2,2))
+plot(gmod.adjr2)
+plot(gmod.bic)
+
+par(mfrow = c(1,2))
+boxcox(gmod.adjr2)
+boxcox(gmod.bic)
+
+sum((test_y - predict(gmod.adjr2, newdata = test))^2)
+sum((test_y - predict(gmod.bic, newdata = test))^2)
+
+```
+
+```{r ols modeling}
+set.seed(1190)
+
+# Model with best RSS of each size
+ols.full <- summary(regsubsets(sqrt_y ~ ., data = train, nvmax = 20))
+
+# Create object of models to find grouped models
+ols.sub <- cbind(p = row.names(ols.full$which), 
+                 as.tibble(ols.full$which), 
+                 rss = ols.full$rss,
+                 adjr2 = ols.full$adjr2,
+                 bic = ols.full$bic)
+
+# Calculate AIC
+ols.sub$aic = n * log(ols.sub$rss/n) + 2 * (as.integer(ols.sub$p) + 1)
+
+# "Best" OLS models by various criteria
+ols.sub[c(which.max(ols.sub$adjr2),
+          which.min(ols.sub$bic),
+          which.min(ols.sub$aic)),]
+
+# Same as when grouped
+# mod.adjr2 <- lm(sqrt_y ~ year + officers_per_1000 + civilians_per_1000 + population + regionMW + regionS + regionW + hisp_prop + black_prop + violent_prop + crime_per_1000, 
+#                 data = train)
+# 
+# par(mfrow = c(2,2))
+# plot(mod.adjr2)
+# plot(mod.bic)
+# 
+# sum((test_y - predict(mod.adjr2, newdata = test))^2)
+
+# Different than previous
+mod.bic <- lm(sqrt_y ~ officers_per_1000 + civilians_per_1000 + population + regionS + hisp_prop + crime_per_1000, 
+                data = train)
+
+# par(mfrow = c(1,2))
+# boxcox(mod.adjr2)
+boxcox(mod.bic)
+
+sum((test_y - predict(mod.bic, newdata = test))^2)
+
+```
+
+```{r penalized regression a}
+set.seed(1190)
+
+mod.l <- cv.glmnet(x = as.matrix(ctrain_x), y = train_y, type.measure = "mse")
+mod.r <- cv.glmnet(x = as.matrix(ctrain_x), y = train_y, type.measure = "mse", 
+                   alpha = 0)
+
+sum((test_y - predict(mod.l, newx = as.matrix(ctest_x), s = mod.l$lambda.min))^2)
+sum((test_y - predict(mod.r, newx = as.matrix(ctest_x), s = mod.r$lambda.min))^2)
+
+```
+
+
+```{r penalized regression b}
+set.seed(1190)
+
+train_obj <- trainControl(method = "cv", number = 10)
+mod.enet <- train(sqrt_y ~ ., data = train, 
+      method = "glmnet", trControl = train_obj, tuneLength = 15)
+
+sum((test_y - predict.train(mod.enet, newdata = ctest_x))^2)
+
+```
+
+```{r final model info}
+
+par(mfrow = c(2, 2))
+plot(gmod.bic)
+boxcox(gmod.bic)
+
+summary(gmod.bic)
+
+# Outlier investigation
+main2 %>% filter(state_abb == "AZ")
+main2 %>% filter(state_abb == "CO")
+
+apply(train[,c("regionMW", "regionS", "regionW")], 2, max)
+apply(train[,c("regionMW", "regionS", "regionW")], 2, min)
+
+```
+
+```{r map}
+
+library(ggrepel)
+library(maps)
+
+states <- map_data("state")
+
+plot_info <- main %>% 
+   filter(year == 2020) %>% 
+   select(state_abb, fatalities, region) %>% 
+   rename(section = region) %>% 
+   full_join(tibble(state_abb = state.abb,
+                state_clong = state.center$x,
+                state_clat = state.center$y, 
+                region = tolower(state.name)),
+         by = "state_abb")
+
+plot_info$fatalities[is.na(plot_info$fatalities)] <- 0
+plot_info$section[which(plot_info$state_abb == "VT")] <- "NE"
+plot_info$section[which(plot_info$state_abb == "WY")] <- "W"
+plot_info$section[which(plot_info$state_abb == "RI")] <- "NE"
+
+p_final <- plot_info %>% 
+   left_join(states, by = "region") 
+
+p_final %>% ggplot() + geom_polygon(aes(x = long, y = lat, fill = section, group = group), color = "white") + coord_quickmap() + geom_label_repel(data = plot_info, aes(label = fatalities, x = state_clong, y = state_clat)) + theme_classic() + ggtitle(" Fatal Police Shootings for 2020 as of Nov. 11") + labs(fill = "Region")
+
+```
+
+```{r poisson model comparison}
+
+train_obj2 <- trainControl(method = "cv", number = 10)
+mod.enet2 <- train(sqrt_y^2 ~ ., data = train, 
+                   link = "poisson", method = "glmnet", 
+                   trControl = train_obj, tuneLength = 15)
+
+comp <- cv.glmnet(y = c(train$sqrt_y^2),
+       x = as.matrix(train %>% select(-sqrt_y)), 
+       family = "poisson", alpha = 0.2928571, type.measure = "deviance")
+
+plot(comp)
+coef(comp, s = comp$lambda.min)
+
+sum((sqrt(predict(comp, newx = as.matrix(test %>% select(-sqrt_y)), s = comp$lambda.min, type = "response")) - test$sqrt_y)^2)
+sum((test_y - predict(gmod.bic, newdata = test))^2)
+
+```
+
+
+
+
+
+
+
+
