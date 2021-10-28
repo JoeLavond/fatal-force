@@ -1,4 +1,4 @@
-# Fatal-Force  
+# Fatal Force  
 The modeling of fatal shootings by on-duty police officers  
 
 **A STOR 664 & 665: Applied I & II (first year Ph.D. applied core course series) project(s) at the University of North Carolina at Chapel Hill**  
